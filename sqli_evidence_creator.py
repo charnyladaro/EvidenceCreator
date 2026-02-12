@@ -146,10 +146,10 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
 
         panel.add(config, BorderLayout.NORTH)
 
-        # -- Centre: request viewer + send button + results table + detail --
+        # -- Centre: button bar + results table + side-by-side viewers --
         centre = JPanel(BorderLayout(5, 5))
 
-        # Request viewer (collapsible)
+        # Raw Request panel (left viewer)
         self._req_panel = JPanel(BorderLayout())
         self._req_panel.setBorder(BorderFactory.createTitledBorder("Raw Request (right-click 'Send to SQLi Repeater')"))
         self._request_viewer = self._callbacks.createMessageEditor(self, False)
@@ -165,11 +165,6 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
         btn_bar.add(Box.createHorizontalStrut(20))
         btn_bar.add(self._btn_toggle_raw)
 
-        # Wrapper that holds the collapsible request panel + button bar
-        req_wrapper = JPanel(BorderLayout())
-        req_wrapper.add(self._req_panel, BorderLayout.CENTER)
-        req_wrapper.add(btn_bar, BorderLayout.SOUTH)
-
         # Results table
         self._results_model = ResultsTableModel()
         self._results_table = JTable(self._results_model)
@@ -180,25 +175,41 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
         results_scroll = JScrollPane(self._results_table)
         results_scroll.setPreferredSize(Dimension(0, 200))
 
-        # Detail viewers (request + response stacked vertically)
+        # Detail viewers with titled borders
         self._detail_request_viewer = self._callbacks.createMessageEditor(self, False)
         self._detail_response_viewer = self._callbacks.createMessageEditor(self, False)
+
+        payload_req_panel = JPanel(BorderLayout())
+        payload_req_panel.setBorder(BorderFactory.createTitledBorder("Payload Request"))
+        payload_req_panel.add(self._detail_request_viewer.getComponent(), BorderLayout.CENTER)
+
+        response_panel = JPanel(BorderLayout())
+        response_panel.setBorder(BorderFactory.createTitledBorder("Response"))
+        response_panel.add(self._detail_response_viewer.getComponent(), BorderLayout.CENTER)
+
+        # Request and Response details side by side (horizontal)
         detail_split = JSplitPane(
-            JSplitPane.VERTICAL_SPLIT,
-            self._detail_request_viewer.getComponent(),
-            self._detail_response_viewer.getComponent()
+            JSplitPane.HORIZONTAL_SPLIT,
+            payload_req_panel,
+            response_panel
         )
         detail_split.setResizeWeight(0.5)
 
-        # Combine results table + detail into a vertical split
-        bottom_split = JSplitPane(JSplitPane.VERTICAL_SPLIT, results_scroll, detail_split)
-        bottom_split.setResizeWeight(0.35)
+        # Raw Request and Payload details side by side (horizontal)
+        self._viewers_split = JSplitPane(
+            JSplitPane.HORIZONTAL_SPLIT,
+            self._req_panel,
+            detail_split
+        )
+        self._viewers_split.setResizeWeight(0.33)
 
-        # Combine request wrapper (top) and bottom section
-        self._top_bottom_split = JSplitPane(JSplitPane.VERTICAL_SPLIT, req_wrapper, bottom_split)
-        self._top_bottom_split.setResizeWeight(0.25)
+        # Results table (top) and viewers (bottom) in vertical split
+        table_viewers_split = JSplitPane(JSplitPane.VERTICAL_SPLIT, results_scroll, self._viewers_split)
+        table_viewers_split.setResizeWeight(0.35)
 
-        centre.add(self._top_bottom_split, BorderLayout.CENTER)
+        # Button bar at top, table + viewers in center
+        centre.add(btn_bar, BorderLayout.NORTH)
+        centre.add(table_viewers_split, BorderLayout.CENTER)
         panel.add(centre, BorderLayout.CENTER)
         return panel
 
@@ -294,7 +305,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             self._btn_toggle_raw.setText("Show Raw Request")
         else:
             self._btn_toggle_raw.setText("Hide Raw Request")
-        self._top_bottom_split.resetToPreferredSizes()
+        self._viewers_split.resetToPreferredSizes()
 
     # =======================================================================
     # TAB 2 – SEND ALL
