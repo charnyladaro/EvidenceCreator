@@ -149,19 +149,26 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
         # -- Centre: request viewer + send button + results table + detail --
         centre = JPanel(BorderLayout(5, 5))
 
-        # Request viewer
-        req_panel = JPanel(BorderLayout())
-        req_panel.setBorder(BorderFactory.createTitledBorder("Raw Request (right-click 'Send to SQLi Repeater')"))
+        # Request viewer (collapsible)
+        self._req_panel = JPanel(BorderLayout())
+        self._req_panel.setBorder(BorderFactory.createTitledBorder("Raw Request (right-click 'Send to SQLi Repeater')"))
         self._request_viewer = self._callbacks.createMessageEditor(self, False)
-        req_panel.add(self._request_viewer.getComponent(), BorderLayout.CENTER)
+        self._req_panel.add(self._request_viewer.getComponent(), BorderLayout.CENTER)
 
-        # Send All button
+        # Send All button + toggle Raw Request visibility
         btn_bar = JPanel(FlowLayout(FlowLayout.LEFT))
         self._btn_send_all = JButton("Send All", actionPerformed=lambda e: self._send_all())
         self._send_status_label = JLabel("")
+        self._btn_toggle_raw = JButton("Hide Raw Request", actionPerformed=lambda e: self._toggle_raw_request())
         btn_bar.add(self._btn_send_all)
         btn_bar.add(self._send_status_label)
-        req_panel.add(btn_bar, BorderLayout.SOUTH)
+        btn_bar.add(Box.createHorizontalStrut(20))
+        btn_bar.add(self._btn_toggle_raw)
+
+        # Wrapper that holds the collapsible request panel + button bar
+        req_wrapper = JPanel(BorderLayout())
+        req_wrapper.add(self._req_panel, BorderLayout.CENTER)
+        req_wrapper.add(btn_bar, BorderLayout.SOUTH)
 
         # Results table
         self._results_model = ResultsTableModel()
@@ -173,11 +180,11 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
         results_scroll = JScrollPane(self._results_table)
         results_scroll.setPreferredSize(Dimension(0, 200))
 
-        # Detail viewers (request + response side-by-side)
+        # Detail viewers (request + response stacked vertically)
         self._detail_request_viewer = self._callbacks.createMessageEditor(self, False)
         self._detail_response_viewer = self._callbacks.createMessageEditor(self, False)
         detail_split = JSplitPane(
-            JSplitPane.HORIZONTAL_SPLIT,
+            JSplitPane.VERTICAL_SPLIT,
             self._detail_request_viewer.getComponent(),
             self._detail_response_viewer.getComponent()
         )
@@ -185,13 +192,13 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
 
         # Combine results table + detail into a vertical split
         bottom_split = JSplitPane(JSplitPane.VERTICAL_SPLIT, results_scroll, detail_split)
-        bottom_split.setResizeWeight(0.4)
+        bottom_split.setResizeWeight(0.35)
 
-        # Combine request viewer (top) and bottom section
-        top_bottom = JSplitPane(JSplitPane.VERTICAL_SPLIT, req_panel, bottom_split)
-        top_bottom.setResizeWeight(0.3)
+        # Combine request wrapper (top) and bottom section
+        self._top_bottom_split = JSplitPane(JSplitPane.VERTICAL_SPLIT, req_wrapper, bottom_split)
+        self._top_bottom_split.setResizeWeight(0.25)
 
-        centre.add(top_bottom, BorderLayout.CENTER)
+        centre.add(self._top_bottom_split, BorderLayout.CENTER)
         panel.add(centre, BorderLayout.CENTER)
         return panel
 
@@ -276,6 +283,18 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             self._main_tabs.setSelectedIndex(1)
 
         SwingUtilities.invokeLater(_Runnable(_update))
+
+    # =======================================================================
+    # TAB 2 – TOGGLE RAW REQUEST
+    # =======================================================================
+    def _toggle_raw_request(self):
+        visible = self._req_panel.isVisible()
+        self._req_panel.setVisible(not visible)
+        if visible:
+            self._btn_toggle_raw.setText("Show Raw Request")
+        else:
+            self._btn_toggle_raw.setText("Hide Raw Request")
+        self._top_bottom_split.resetToPreferredSizes()
 
     # =======================================================================
     # TAB 2 – SEND ALL
