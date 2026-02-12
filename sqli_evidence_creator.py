@@ -18,6 +18,7 @@ from javax.swing import (
 from javax.swing.table import AbstractTableModel
 from javax.swing.event import ListSelectionListener
 from java.awt import BorderLayout, FlowLayout, GridBagLayout, GridBagConstraints, Insets, Dimension, Font, Color
+from java.awt.event import KeyListener as JKeyListener
 from java.lang import Runnable, Short
 from java.io import File
 from java.net import URL
@@ -559,7 +560,7 @@ class _SelectionListener(ListSelectionListener):
             self._fn()
 
 
-class _KeyAdapter(object):
+class _KeyAdapter(JKeyListener):
     """Minimal KeyListener that calls fn on keyReleased."""
     def __init__(self, fn):
         self._fn = fn
