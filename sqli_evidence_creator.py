@@ -515,12 +515,20 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             filename = "%03d_%s.txt" % (idx, snippet)
             filepath = os.path.join(folder, filename)
 
+            # Convert Java byte arrays to strings (use 'is not None' – Java
+            # byte arrays are not reliably truthy in Jython bool context)
             req_text = ""
-            if entry.get("request"):
-                req_text = helpers.bytesToString(entry["request"])
+            if entry.get("request") is not None:
+                try:
+                    req_text = helpers.bytesToString(entry["request"])
+                except Exception:
+                    req_text = str(entry["request"])
             resp_text = ""
-            if entry.get("response"):
-                resp_text = helpers.bytesToString(entry["response"])
+            if entry.get("response") is not None:
+                try:
+                    resp_text = helpers.bytesToString(entry["response"])
+                except Exception:
+                    resp_text = str(entry["response"])
 
             content = "%s\n%s\n%s\n" % (req_text, "=" * 40, resp_text)
 
