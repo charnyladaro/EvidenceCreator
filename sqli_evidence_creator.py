@@ -6,14 +6,15 @@ Jython-based extension for SQL injection testing and evidence collection.
 Tabs:
   1. SQL Syntax   - Manage SQL payloads (one per line)
   2. Auto Repeater - Send requests with each payload injected, view results
-  3. Report        - Generate per-payload .txt evidence files
+  3. Report        - Generate per-payload .txt evidence files (including redirects)
 """
 
 from burp import IBurpExtender, ITab, IContextMenuFactory, IMessageEditorController
 from javax.swing import (
     JPanel, JTabbedPane, JTextArea, JScrollPane, JButton, JLabel,
     JTextField, JCheckBox, JTable, JSplitPane, JFileChooser, JMenuItem,
-    JOptionPane, SwingUtilities, BorderFactory, BoxLayout, Box
+    JOptionPane, SwingUtilities, BorderFactory, BoxLayout, Box,
+    JRadioButton, ButtonGroup
 )
 from javax.swing.table import AbstractTableModel
 from javax.swing.event import ListSelectionListener
@@ -25,6 +26,9 @@ from java.net import URL
 import re
 import os
 import threading
+
+# Maximum number of redirects to follow per request
+MAX_REDIRECTS = 10
 
 
 # ---------------------------------------------------------------------------
@@ -132,17 +136,64 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
         self._host_field = JTextField(25)
         self._port_field = JTextField("443", 6)
         self._https_cb = JCheckBox("HTTPS", True)
-        self._param_field = JTextField(20)
 
-        labels = ["Host:", "Port:", "", "Parameter:"]
-        widgets = [self._host_field, self._port_field, self._https_cb, self._param_field]
-        for i, (lbl, wid) in enumerate(zip(labels, widgets)):
-            gbc.gridx = i * 2
-            gbc.gridy = 0
-            if lbl:
-                config.add(JLabel(lbl), gbc)
-            gbc.gridx = i * 2 + 1
-            config.add(wid, gbc)
+        # --- param=value / header=value field (shared, label changes with target) ---
+        self._param_field = JTextField(30)
+        self._param_field_label = JLabel("Parameter=Value:")
+        self._hint_label = JLabel("e.g.  id=123  or  UserId=25  or  username=admin")
+        self._hint_label.setFont(Font("Dialog", Font.ITALIC, 11))
+        self._hint_label.setForeground(Color(120, 120, 120))
+
+        # --- Injection target: Parameter (Query/Body) OR HTTP Header ---
+        self._rb_target_param  = JRadioButton("Query / Body Parameter", True)
+        self._rb_target_header = JRadioButton("HTTP Header")
+        target_group = ButtonGroup()
+        target_group.add(self._rb_target_param)
+        target_group.add(self._rb_target_header)
+
+        def _on_target_change(e):
+            if self._rb_target_param.isSelected():
+                self._param_field_label.setText("Parameter=Value:")
+                self._hint_label.setText("e.g.  id=123  or  UserId=25  or  username=admin")
+            else:
+                self._param_field_label.setText("Header=Value:")
+                self._hint_label.setText("e.g.  User-Agent=Mozilla  or  X-Forwarded-For=127.0.0.1  or  Host=example.com")
+
+        self._rb_target_param.addActionListener(_on_target_change)
+        self._rb_target_header.addActionListener(_on_target_change)
+
+        target_panel = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
+        target_panel.add(JLabel("Injection target:"))
+        target_panel.add(self._rb_target_param)
+        target_panel.add(self._rb_target_header)
+
+        # --- Inject mode: Replace value / Retain value + append payload ---
+        self._rb_replace = JRadioButton("Replace value", True)
+        self._rb_retain  = JRadioButton("Retain value + append payload")
+        inject_group = ButtonGroup()
+        inject_group.add(self._rb_replace)
+        inject_group.add(self._rb_retain)
+        mode_panel = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
+        mode_panel.add(JLabel("Inject mode:"))
+        mode_panel.add(self._rb_replace)
+        mode_panel.add(self._rb_retain)
+
+        # Row 0: Host / Port / HTTPS / Parameter=Value (label changes dynamically)
+        gbc.gridy = 0
+        gbc.gridx = 0; config.add(JLabel("Host:"), gbc)
+        gbc.gridx = 1; config.add(self._host_field, gbc)
+        gbc.gridx = 2; config.add(JLabel("Port:"), gbc)
+        gbc.gridx = 3; config.add(self._port_field, gbc)
+        gbc.gridx = 4; config.add(self._https_cb, gbc)
+        gbc.gridx = 5; config.add(self._param_field_label, gbc)
+        gbc.gridx = 6; config.add(self._param_field, gbc)
+
+        # Row 1: hint / target selector / inject mode
+        gbc.gridy = 1
+        gbc.gridx = 0; gbc.gridwidth = 3; config.add(self._hint_label, gbc)
+        gbc.gridx = 3; gbc.gridwidth = 2; config.add(target_panel, gbc)
+        gbc.gridx = 5; gbc.gridwidth = 2; config.add(mode_panel, gbc)
+        gbc.gridwidth = 1
 
         panel.add(config, BorderLayout.NORTH)
 
@@ -318,21 +369,34 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
         if self._request_bytes is None:
             JOptionPane.showMessageDialog(self._main_tabs, "No base request loaded.\nRight-click a request and choose 'Send to SQLi Repeater'.", "Warning", JOptionPane.WARNING_MESSAGE)
             return
-        param_name = self._param_field.getText().strip()
-        if not param_name:
-            JOptionPane.showMessageDialog(self._main_tabs, "Please enter a parameter name.", "Warning", JOptionPane.WARNING_MESSAGE)
+
+        param_input = self._param_field.getText().strip()
+        if not param_input or "=" not in param_input:
+            if self._rb_target_header.isSelected():
+                example = "User-Agent=Mozilla  or  X-Forwarded-For=127.0.0.1"
+            else:
+                example = "id=1  or  UserId=25  or  username=admin"
+            JOptionPane.showMessageDialog(
+                self._main_tabs,
+                "Please enter the target in 'name=value' format.\nExample: %s" % example,
+                "Warning",
+                JOptionPane.WARNING_MESSAGE
+            )
             return
+
+        retain_value   = self._rb_retain.isSelected()
+        inject_target  = "header" if self._rb_target_header.isSelected() else "param"
 
         # Disable button while running
         self._btn_send_all.setEnabled(False)
         self._send_status_label.setText("Sending...")
 
         # Run in background thread to avoid freezing UI
-        t = threading.Thread(target=self._send_all_worker, args=(payloads, param_name))
+        t = threading.Thread(target=self._send_all_worker, args=(payloads, param_input, retain_value, inject_target))
         t.daemon = True
         t.start()
 
-    def _send_all_worker(self, payloads, param_name):
+    def _send_all_worker(self, payloads, param_input, retain_value=False, inject_target="param"):
         results = []
         host = self._host_field.getText().strip()
         try:
@@ -343,9 +407,17 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
 
         base_request = self._helpers.bytesToString(self._request_bytes)
 
+        # Split param_input into name and current value
+        eq_idx = param_input.index("=")
+        param_name  = param_input[:eq_idx]
+        param_value = param_input[eq_idx + 1:]
+
         for idx, payload in enumerate(payloads):
             try:
-                modified = self._inject_payload(base_request, param_name, payload)
+                if inject_target == "header":
+                    modified = self._inject_payload_in_header(base_request, param_name, param_value, payload, retain_value)
+                else:
+                    modified = self._inject_payload(base_request, param_name, param_value, payload, retain_value)
                 mod_bytes = self._helpers.stringToBytes(modified)
 
                 http_service = self._helpers.buildHttpService(host, port, use_https)
@@ -354,10 +426,16 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
                 resp_bytes = response_obj.getResponse()
                 status_code = ""
                 resp_length = 0
+                redirects = []
+
                 if resp_bytes:
                     info = self._helpers.analyzeResponse(resp_bytes)
                     status_code = str(info.getStatusCode())
                     resp_length = len(resp_bytes)
+
+                    # Follow redirects if 3xx
+                    if status_code.startswith("3"):
+                        redirects = self._follow_redirects(resp_bytes, http_service, host, port, use_https)
 
                 results.append({
                     "index": idx + 1,
@@ -366,6 +444,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
                     "length": resp_length,
                     "request": mod_bytes,
                     "response": resp_bytes,
+                    "redirects": redirects,   # list of {"request": bytes, "response": bytes}
                 })
             except Exception as ex:
                 results.append({
@@ -375,6 +454,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
                     "length": 0,
                     "request": None,
                     "response": None,
+                    "redirects": [],
                 })
                 self._callbacks.printError("Payload #%d error: %s" % (idx + 1, str(ex)))
 
@@ -392,67 +472,298 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
 
         SwingUtilities.invokeLater(_Runnable(_done))
 
-    def _inject_payload(self, raw_request, param_name, payload):
-        """Replace param_name's value in GET query string or POST url-encoded body."""
-        # Split headers and body
+    # =======================================================================
+    # REDIRECT FOLLOWING
+    # =======================================================================
+    def _follow_redirects(self, response_bytes, http_service, host, port, use_https):
+        """
+        Follow HTTP 3xx redirects up to MAX_REDIRECTS times.
+        Returns a list of {'request': bytes, 'response': bytes} for each hop.
+        """
+        chain = []
+        current_response = response_bytes
+        current_host = host
+        current_port = port
+        current_https = use_https
+
+        for _ in range(MAX_REDIRECTS):
+            location = self._extract_location_header(current_response)
+            if not location:
+                break
+
+            # Parse the Location URL – may be absolute or relative
+            req_bytes, next_host, next_port, next_https = self._build_redirect_request(
+                location, current_host, current_port, current_https
+            )
+            if req_bytes is None:
+                break
+
+            try:
+                next_service = self._helpers.buildHttpService(next_host, next_port, next_https)
+                resp_obj = self._callbacks.makeHttpRequest(next_service, req_bytes)
+                resp_bytes = resp_obj.getResponse()
+
+                chain.append({"request": req_bytes, "response": resp_bytes})
+
+                if resp_bytes:
+                    info = self._helpers.analyzeResponse(resp_bytes)
+                    status = str(info.getStatusCode())
+                    if not status.startswith("3"):
+                        break
+                    current_response = resp_bytes
+                    current_host = next_host
+                    current_port = next_port
+                    current_https = next_https
+                else:
+                    break
+            except Exception as ex:
+                self._callbacks.printError("Redirect follow error: %s" % str(ex))
+                break
+
+        return chain
+
+    def _extract_location_header(self, response_bytes):
+        """Extract the value of the Location header from a raw HTTP response."""
+        try:
+            resp_str = self._helpers.bytesToString(response_bytes)
+            for line in resp_str.split("\r\n"):
+                if line.lower().startswith("location:"):
+                    return line[len("location:"):].strip()
+        except Exception:
+            pass
+        return None
+
+    def _build_redirect_request(self, location, current_host, current_port, current_https):
+        """
+        Build a minimal GET request for the redirect location.
+        Returns (request_bytes, host, port, use_https) or (None, ...) on failure.
+        """
+        try:
+            # Absolute URL
+            m = re.match(r'^(https?)://([^/:\s]+)(?::(\d+))?(.*)?$', location, re.IGNORECASE)
+            if m:
+                scheme = m.group(1).lower()
+                redir_host = m.group(2)
+                redir_port = int(m.group(3)) if m.group(3) else (443 if scheme == "https" else 80)
+                redir_path = m.group(4) if m.group(4) else "/"
+                redir_https = (scheme == "https")
+            else:
+                # Relative URL – same host/port/scheme
+                redir_host = current_host
+                redir_port = current_port
+                redir_https = current_https
+                redir_path = location if location.startswith("/") else "/" + location
+
+            if not redir_path:
+                redir_path = "/"
+
+            raw = "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n" % (redir_path, redir_host)
+            req_bytes = self._helpers.stringToBytes(raw)
+            return req_bytes, redir_host, redir_port, redir_https
+        except Exception as ex:
+            self._callbacks.printError("_build_redirect_request error: %s" % str(ex))
+            return None, current_host, current_port, current_https
+
+    # =======================================================================
+    # HEADER INJECTION
+    # =======================================================================
+    def _inject_payload_in_header(self, raw_request, header_name, header_value, payload, retain=False):
+        """
+        Inject payload into a specific HTTP request header identified by
+        header_name and its current value (header_value).
+
+        Special handling:
+          - Cookie header: injects into cookie pairs (name=value style)
+          - All other headers: replaces / appends in the full header value
+
+        retain=False → replace header_value with payload
+        retain=True  → keep header_value and append payload after it
+
+        If the header is not found or its value does not match, the request
+        is returned unchanged (no silent corruption).
+        """
         parts = raw_request.split("\r\n\r\n", 1)
         header_section = parts[0]
         body = parts[1] if len(parts) > 1 else ""
 
         lines = header_section.split("\r\n")
-        request_line = lines[0]  # e.g. GET /path?a=1&b=2 HTTP/1.1
+        new_lines = []
+        matched = False
 
-        # Try to replace in query string (GET parameters)
-        match = re.match(r'^(\S+)\s+([^\s\?]+)(\?[^\s]*)?\s+(HTTP/\S+)', request_line)
-        if match:
-            method = match.group(1)
-            path = match.group(2)
-            query = match.group(3) or ""
-            proto = match.group(4)
+        for line in lines:
+            colon_pos = line.find(":")
+            if colon_pos <= 0:
+                new_lines.append(line)
+                continue
+
+            this_name  = line[:colon_pos].strip()
+            this_value = line[colon_pos + 1:].strip()
+
+            if this_name.lower() != header_name.lower():
+                new_lines.append(line)
+                continue
+
+            # ---- Special case: Cookie header (name=value; name2=value2) ----
+            if this_name.lower() == "cookie":
+                new_cookie = self._replace_param_in_cookie(line, header_value, header_value, payload, retain)
+                # For Cookie we treat header_value as both param_name and value anchor:
+                # the user enters  CookieName=cookievalue, so we look for "CookieName=cookievalue"
+                # _replace_param_in_cookie already does that.  If it doesn't match, fall through
+                # and try a raw value replacement inside the cookie string.
+                if new_cookie is not None:
+                    new_lines.append(new_cookie)
+                    matched = True
+                    continue
+                # Fallback: raw replacement inside the cookie string
+                if header_value in this_value:
+                    if retain:
+                        new_val = this_value.replace(header_value, header_value + payload, 1)
+                    else:
+                        new_val = this_value.replace(header_value, payload, 1)
+                    new_lines.append("%s: %s" % (this_name, new_val))
+                    matched = True
+                    continue
+                new_lines.append(line)
+                continue
+
+            # ---- All other headers: match the full value or a substring ----
+            if this_value == header_value:
+                # Exact match – replace whole value
+                injected = (header_value + payload) if retain else payload
+                new_lines.append("%s: %s" % (this_name, injected))
+                matched = True
+            elif header_value in this_value:
+                # Substring match (e.g. User-Agent might be long) – replace first occurrence
+                if retain:
+                    new_val = this_value.replace(header_value, header_value + payload, 1)
+                else:
+                    new_val = this_value.replace(header_value, payload, 1)
+                new_lines.append("%s: %s" % (this_name, new_val))
+                matched = True
+            else:
+                new_lines.append(line)
+
+        if not matched:
+            self._callbacks.printError(
+                "_inject_payload_in_header: header '%s' with value '%s' not found in request."
+                % (header_name, header_value)
+            )
+
+        return "\r\n".join(new_lines) + "\r\n\r\n" + body
+
+    # =======================================================================
+    # PAYLOAD INJECTION  (param=value aware)
+    # =======================================================================
+    def _inject_payload(self, raw_request, param_name, param_value, payload, retain=False):
+        """
+        Inject payload into the field identified by param_name=param_value.
+
+        retain=False → replace the current value entirely with payload
+        retain=True  → keep the current value and append payload right after it
+
+        Search order:
+          1. GET query string
+          2. POST url-encoded body
+          3. JSON body  (string value: "param": "value"  OR numeric: "param": 25)
+          4. Cookie header
+          5. Any raw occurrence of param_name=param_value (fallback)
+        """
+        parts = raw_request.split("\r\n\r\n", 1)
+        header_section = parts[0]
+        body = parts[1] if len(parts) > 1 else ""
+
+        lines = header_section.split("\r\n")
+        request_line = lines[0]
+
+        # ---- 1. GET query string ----
+        m = re.match(r'^(\S+)\s+([^\s\?]+)(\?[^\s]*)?\s+(HTTP/\S+)', request_line)
+        if m:
+            method = m.group(1)
+            path = m.group(2)
+            query = m.group(3) or ""
+            proto = m.group(4)
 
             if query:
-                new_query = self._replace_param_in_qs(query[1:], param_name, payload)
+                new_query = self._replace_param_in_qs(query[1:], param_name, param_value, payload, retain)
                 if new_query is not None:
                     lines[0] = "%s %s?%s %s" % (method, path, new_query, proto)
                     return "\r\n".join(lines) + "\r\n\r\n" + body
 
-        # Try to replace in POST body (url-encoded)
+        # ---- 2. POST url-encoded body ----
         if body:
-            new_body = self._replace_param_in_qs(body, param_name, payload)
+            new_body = self._replace_param_in_qs(body, param_name, param_value, payload, retain)
             if new_body is not None:
-                # Update Content-Length
-                new_header_lines = []
-                cl_updated = False
-                for line in lines:
-                    if line.lower().startswith("content-length:"):
-                        new_header_lines.append("Content-Length: %d" % len(new_body))
-                        cl_updated = True
-                    else:
-                        new_header_lines.append(line)
-                if not cl_updated:
-                    new_header_lines.append("Content-Length: %d" % len(new_body))
+                new_header_lines = self._update_content_length(lines, new_body)
                 return "\r\n".join(new_header_lines) + "\r\n\r\n" + new_body
 
-        # Fallback: direct text replacement of param=<value>
-        pattern = r'(%s=)([^&\s]*)' % re.escape(param_name)
-        replaced, count = re.subn(pattern, r'\g<1>' + payload.replace('\\', '\\\\'), raw_request)
+        # ---- 3. JSON body (string or numeric value) ----
+        if body:
+            new_body = self._replace_param_in_json(body, param_name, param_value, payload, retain)
+            if new_body is not None:
+                new_header_lines = self._update_content_length(lines, new_body)
+                return "\r\n".join(new_header_lines) + "\r\n\r\n" + new_body
+
+        # ---- 4. Cookie header ----
+        new_header_lines = []
+        replaced_in_cookie = False
+        for line in lines:
+            if line.lower().startswith("cookie:") and not replaced_in_cookie:
+                new_line = self._replace_param_in_cookie(line, param_name, param_value, payload, retain)
+                if new_line is not None:
+                    new_header_lines.append(new_line)
+                    replaced_in_cookie = True
+                    continue
+            new_header_lines.append(line)
+        if replaced_in_cookie:
+            return "\r\n".join(new_header_lines) + "\r\n\r\n" + body
+
+        # ---- 5. Raw fallback: replace exact param_name=param_value anywhere ----
+        if retain:
+            replacement = param_value + payload
+        else:
+            replacement = payload
+        replaced, count = re.subn(
+            r'(%s=)%s' % (re.escape(param_name), re.escape(param_value)),
+            r'\g<1>' + replacement.replace('\\', '\\\\'),
+            raw_request
+        )
         if count > 0:
             return replaced
 
         return raw_request
 
     @staticmethod
-    def _replace_param_in_qs(qs, param_name, new_value):
-        """Replace a parameter value inside a query-string / url-encoded body.
-        Returns the modified string, or None if param not found."""
+    def _update_content_length(header_lines, new_body):
+        """Return header_lines with Content-Length updated to match new_body length."""
+        updated = []
+        found = False
+        for line in header_lines:
+            if line.lower().startswith("content-length:"):
+                updated.append("Content-Length: %d" % len(new_body))
+                found = True
+            else:
+                updated.append(line)
+        if not found:
+            updated.append("Content-Length: %d" % len(new_body))
+        return updated
+
+    @staticmethod
+    def _replace_param_in_qs(qs, param_name, param_value, new_value, retain=False):
+        """
+        Replace param_name=param_value inside a query-string / url-encoded body.
+        Only replaces if the current value matches param_value exactly.
+        retain=True: keeps param_value and appends new_value.
+        Returns modified string or None if not found/matched.
+        """
         pairs = qs.split("&")
         found = False
         new_pairs = []
         for pair in pairs:
             if "=" in pair:
-                key, _ = pair.split("=", 1)
-                if key == param_name:
-                    new_pairs.append("%s=%s" % (key, new_value))
+                key, val = pair.split("=", 1)
+                if key == param_name and val == param_value:
+                    injected = (param_value + new_value) if retain else new_value
+                    new_pairs.append("%s=%s" % (key, injected))
                     found = True
                 else:
                     new_pairs.append(pair)
@@ -460,6 +771,67 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
                 new_pairs.append(pair)
         if found:
             return "&".join(new_pairs)
+        return None
+
+    @staticmethod
+    def _replace_param_in_json(body, param_name, param_value, new_value, retain=False):
+        """
+        Replace a JSON value for param_name when it matches param_value.
+        Handles both string values ("param": "value") and numeric values ("param": 25).
+        retain=True: keeps param_value and appends new_value (result is always a JSON string).
+        Returns modified body or None if not found.
+        """
+        safe_new = new_value.replace('\\', '\\\\')
+
+        # --- String value: "param": "value" ---
+        str_pattern = r'("%s"\s*:\s*")%s(")' % (re.escape(param_name), re.escape(param_value))
+        if retain:
+            str_replacement = r'\g<1>' + param_value + safe_new + r'\g<2>'
+        else:
+            str_replacement = r'\g<1>' + safe_new + r'\g<2>'
+        new_body, count = re.subn(str_pattern, str_replacement, body)
+        if count > 0:
+            return new_body
+
+        # --- Numeric / boolean / null value: "param": 25  or  "param": true ---
+        num_pattern = r'("%s"\s*:\s*)%s(\s*[,}\]\r\n])' % (re.escape(param_name), re.escape(param_value))
+        if retain:
+            # wrap as a JSON string containing original value + payload
+            num_replacement = r'\g<1>"' + param_value + safe_new + r'"\g<2>'
+        else:
+            # replace number with a JSON string payload
+            num_replacement = r'\g<1>"' + safe_new + r'"\g<2>'
+        new_body, count = re.subn(num_pattern, num_replacement, body)
+        if count > 0:
+            return new_body
+
+        return None
+
+    @staticmethod
+    def _replace_param_in_cookie(cookie_line, param_name, param_value, new_value, retain=False):
+        """
+        Replace param_name=param_value inside a Cookie: header line.
+        retain=True: keeps param_value and appends new_value.
+        Returns modified line or None if not found.
+        """
+        prefix = cookie_line[:cookie_line.index(":") + 1] + " "
+        cookie_str = cookie_line[len(prefix):]
+        pairs = cookie_str.split("; ")
+        found = False
+        new_pairs = []
+        for pair in pairs:
+            if "=" in pair:
+                key, val = pair.split("=", 1)
+                if key.strip() == param_name and val == param_value:
+                    injected = (param_value + new_value) if retain else new_value
+                    new_pairs.append("%s=%s" % (key, injected))
+                    found = True
+                else:
+                    new_pairs.append(pair)
+            else:
+                new_pairs.append(pair)
+        if found:
+            return prefix + "; ".join(new_pairs)
         return None
 
     def _on_result_row_selected(self):
@@ -512,41 +884,65 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             snippet = re.sub(r'[^a-zA-Z0-9_\-]', '_', payload[:40]).strip('_')
             if not snippet:
                 snippet = "payload"
-            filename = "%03d_%s.txt" % (idx, snippet)
-            filepath = os.path.join(folder, filename)
+            base_name = "%03d_%s" % (idx, snippet)
 
-            # Convert Java byte arrays to strings (use 'is not None' – Java
-            # byte arrays are not reliably truthy in Jython bool context)
-            req_text = ""
-            if entry.get("request") is not None:
-                try:
-                    req_text = helpers.bytesToString(entry["request"])
-                except Exception:
-                    req_text = str(entry["request"])
-            resp_text = ""
-            if entry.get("response") is not None:
-                try:
-                    resp_text = helpers.bytesToString(entry["response"])
-                except Exception:
-                    resp_text = str(entry["response"])
+            # ---- File 1: Original payload request + response ----
+            req_text = self._bytes_to_str(helpers, entry.get("request"))
+            resp_text = self._bytes_to_str(helpers, entry.get("response"))
 
-            content = "%s\n%s\n%s\n" % (req_text, "=" * 40, resp_text)
+            status_note = ""
+            if entry.get("status", "").startswith("3"):
+                status_note = "  [3xx – %d redirect(s) followed, see separate files]" % len(entry.get("redirects", []))
 
-            try:
-                with open(filepath, "w") as f:
-                    f.write(content)
-                self._report_log.append("[+] Created: %s\n" % filepath)
-            except Exception as ex:
-                self._report_log.append("[-] Failed: %s - %s\n" % (filepath, str(ex)))
+            content = (
+                req_text + "\n\n" +
+                "=" * 60 + "\n\n" +
+                resp_text + "\n"
+            )
 
-        self._report_log.append("\nReport generation complete. %d files.\n" % len(self._results))
+            filepath = os.path.join(folder, base_name + ".txt")
+            self._write_file(filepath, content)
+
+            # ---- Files 2..N: Redirect chain ----
+            redirects = entry.get("redirects", [])
+            for r_idx, hop in enumerate(redirects, start=1):
+                hop_req = self._bytes_to_str(helpers, hop.get("request"))
+                hop_resp = self._bytes_to_str(helpers, hop.get("response"))
+
+                hop_content = (
+                    hop_req + "\n\n" +
+                    "=" * 60 + "\n\n" +
+                    hop_resp + "\n"
+                )
+                hop_path = os.path.join(folder, "%s_redirect_%d.txt" % (base_name, r_idx))
+                self._write_file(hop_path, hop_content)
+
+        self._report_log.append("\nReport generation complete. %d payloads processed.\n" % len(self._results))
+
+    def _bytes_to_str(self, helpers, data):
+        """Safely convert a Java byte array to a Python string."""
+        if data is None:
+            return "(none)"
+        try:
+            return helpers.bytesToString(data)
+        except Exception:
+            return str(data)
+
+    def _write_file(self, filepath, content):
+        """Write content to filepath and log the result."""
+        try:
+            with open(filepath, "w") as f:
+                f.write(content)
+            self._report_log.append("[+] Created: %s\n" % filepath)
+        except Exception as ex:
+            self._report_log.append("[-] Failed:  %s – %s\n" % (filepath, str(ex)))
 
 
 # ===========================================================================
 # Table model for results
 # ===========================================================================
 class ResultsTableModel(AbstractTableModel):
-    COLUMNS = ["#", "Payload", "Status Code", "Response Length"]
+    COLUMNS = ["#", "Payload", "Status Code", "Response Length", "Redirects"]
 
     def __init__(self):
         self._results = []
@@ -574,6 +970,8 @@ class ResultsTableModel(AbstractTableModel):
             return entry["status"]
         elif col == 3:
             return entry["length"]
+        elif col == 4:
+            return len(entry.get("redirects", []))
         return ""
 
 
