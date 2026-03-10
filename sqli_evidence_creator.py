@@ -25,6 +25,7 @@ from java.io import File
 from java.net import URL
 import re
 import os
+import io
 import threading
 
 # Maximum number of redirects to follow per request
@@ -315,7 +316,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
         if chooser.showSaveDialog(self._main_tabs) == JFileChooser.APPROVE_OPTION:
             path = chooser.getSelectedFile().getAbsolutePath()
             try:
-                with open(path, "w") as f:
+                with io.open(path, "w", encoding="utf-8", errors="replace") as f:
                     f.write(self._payload_area.getText())
             except Exception as ex:
                 JOptionPane.showMessageDialog(self._main_tabs, str(ex), "Error", JOptionPane.ERROR_MESSAGE)
@@ -931,7 +932,9 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
     def _write_file(self, filepath, content):
         """Write content to filepath and log the result."""
         try:
-            with open(filepath, "w") as f:
+            if isinstance(content, bytes):
+                content = content.decode("utf-8", errors="replace")
+            with io.open(filepath, "w", encoding="utf-8", errors="replace") as f:
                 f.write(content)
             self._report_log.append("[+] Created: %s\n" % filepath)
         except Exception as ex:
