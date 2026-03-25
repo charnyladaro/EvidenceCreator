@@ -145,28 +145,35 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
         self._hint_label.setFont(Font("Dialog", Font.ITALIC, 11))
         self._hint_label.setForeground(Color(120, 120, 120))
 
-        # --- Injection target: Parameter (Query/Body) OR HTTP Header ---
+        # --- Injection target: Parameter (Query/Body) OR HTTP Header OR Path Segment ---
         self._rb_target_param  = JRadioButton("Query / Body Parameter", True)
         self._rb_target_header = JRadioButton("HTTP Header")
+        self._rb_target_path   = JRadioButton("Path Segment")
         target_group = ButtonGroup()
         target_group.add(self._rb_target_param)
         target_group.add(self._rb_target_header)
+        target_group.add(self._rb_target_path)
 
         def _on_target_change(e):
             if self._rb_target_param.isSelected():
                 self._param_field_label.setText("Parameter=Value:")
                 self._hint_label.setText("e.g.  id=123  or  UserId=25  or  username=admin")
-            else:
+            elif self._rb_target_header.isSelected():
                 self._param_field_label.setText("Header=Value:")
-                self._hint_label.setText("e.g.  User-Agent=Mozilla  or  X-Forwarded-For=127.0.0.1  or  Host=example.com")
+                self._hint_label.setText("e.g.  User-Agent=Mozilla  or  id=123  (also injects into matching GET param in the URL)")
+            else:
+                self._param_field_label.setText("Path Segment:")
+                self._hint_label.setText("e.g.  admin  \u2192  GET /admin/userId/ becomes GET /<payload>/userId/  (just enter the segment name, no =value needed)")
 
         self._rb_target_param.addActionListener(_on_target_change)
         self._rb_target_header.addActionListener(_on_target_change)
+        self._rb_target_path.addActionListener(_on_target_change)
 
         target_panel = JPanel(FlowLayout(FlowLayout.LEFT, 4, 0))
         target_panel.add(JLabel("Injection target:"))
         target_panel.add(self._rb_target_param)
         target_panel.add(self._rb_target_header)
+        target_panel.add(self._rb_target_path)
 
         # --- Inject mode: Replace value / Retain value + append payload ---
         self._rb_replace = JRadioButton("Replace value", True)
@@ -372,9 +379,12 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             return
 
         param_input = self._param_field.getText().strip()
-        if not param_input or "=" not in param_input:
+        if not param_input:
+            JOptionPane.showMessageDialog(self._main_tabs, "Please enter the target field.", "Warning", JOptionPane.WARNING_MESSAGE)
+            return
+        if not self._rb_target_path.isSelected() and "=" not in param_input:
             if self._rb_target_header.isSelected():
-                example = "User-Agent=Mozilla  or  X-Forwarded-For=127.0.0.1"
+                example = "User-Agent=Mozilla  or  X-Forwarded-For=127.0.0.1  or  id=123"
             else:
                 example = "id=1  or  UserId=25  or  username=admin"
             JOptionPane.showMessageDialog(
@@ -385,8 +395,13 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             )
             return
 
-        retain_value   = self._rb_retain.isSelected()
-        inject_target  = "header" if self._rb_target_header.isSelected() else "param"
+        retain_value = self._rb_retain.isSelected()
+        if self._rb_target_header.isSelected():
+            inject_target = "header"
+        elif self._rb_target_path.isSelected():
+            inject_target = "path"
+        else:
+            inject_target = "param"
 
         # Disable button while running
         self._btn_send_all.setEnabled(False)
@@ -408,15 +423,21 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
 
         base_request = self._helpers.bytesToString(self._request_bytes)
 
-        # Split param_input into name and current value
-        eq_idx = param_input.index("=")
-        param_name  = param_input[:eq_idx]
-        param_value = param_input[eq_idx + 1:]
+        # Split param_input into name and current value (path mode has no =value)
+        if inject_target == "path":
+            param_name  = param_input
+            param_value = ""
+        else:
+            eq_idx = param_input.index("=")
+            param_name  = param_input[:eq_idx]
+            param_value = param_input[eq_idx + 1:]
 
         for idx, payload in enumerate(payloads):
             try:
                 if inject_target == "header":
                     modified = self._inject_payload_in_header(base_request, param_name, param_value, payload, retain_value)
+                elif inject_target == "path":
+                    modified = self._inject_payload_in_path(base_request, param_name, payload)
                 else:
                     modified = self._inject_payload(base_request, param_name, param_value, payload, retain_value)
                 mod_bytes = self._helpers.stringToBytes(modified)
@@ -650,7 +671,71 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
                 % (header_name, header_value)
             )
 
+        # Also inject into the GET query string if a matching param=value exists there.
+        # This covers cases where the same parameter appears in both the URL and a header.
+        if header_value and new_lines:
+            req_line = new_lines[0]
+            m = re.match(r'^(\S+)\s+([^\s\?]+)(\?[^\s]*)?\s+(HTTP/\S+)', req_line)
+            if m and m.group(3):
+                query = m.group(3)[1:]  # strip leading '?'
+                new_query = self._replace_param_in_qs(query, header_name, header_value, payload, retain)
+                if new_query is not None:
+                    new_lines[0] = "%s %s?%s %s" % (m.group(1), m.group(2), new_query, m.group(4))
+
         return "\r\n".join(new_lines) + "\r\n\r\n" + body
+
+    # =======================================================================
+    # PATH SEGMENT INJECTION
+    # =======================================================================
+    def _inject_payload_in_path(self, raw_request, segment_name, payload):
+        """Inject payload into a named URL path segment.
+
+        e.g. GET /admin/userId/ HTTP/1.1  with  segment_name='admin'
+        becomes  GET /<payload>/userId/ HTTP/1.1
+        Only the first matching segment is replaced.
+        """
+        parts = raw_request.split("\r\n\r\n", 1)
+        header_section = parts[0]
+        body = parts[1] if len(parts) > 1 else ""
+
+        lines = header_section.split("\r\n")
+        request_line = lines[0]
+
+        m = re.match(r'^(\S+)\s+(\S+)\s+(HTTP/\S+)', request_line)
+        if m:
+            method    = m.group(1)
+            full_path = m.group(2)
+            proto     = m.group(3)
+
+            # Separate path from query string
+            path_part  = full_path
+            query_part = ""
+            if "?" in full_path:
+                path_part, query_part = full_path.split("?", 1)
+                query_part = "?" + query_part
+
+            # Replace the first matching segment
+            segments = path_part.split("/")
+            found = False
+            new_segments = []
+            for seg in segments:
+                if not found and seg == segment_name:
+                    new_segments.append(payload)
+                    found = True
+                else:
+                    new_segments.append(seg)
+
+            if found:
+                new_path = "/".join(new_segments)
+                lines[0] = "%s %s%s %s" % (method, new_path, query_part, proto)
+                return "\r\n".join(lines) + "\r\n\r\n" + body
+            else:
+                self._callbacks.printError(
+                    "_inject_payload_in_path: segment '%s' not found in path '%s'."
+                    % (segment_name, path_part)
+                )
+
+        return raw_request
 
     # =======================================================================
     # PAYLOAD INJECTION  (param=value aware)
