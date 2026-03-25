@@ -437,7 +437,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
                 if inject_target == "header":
                     modified = self._inject_payload_in_header(base_request, param_name, param_value, payload, retain_value)
                 elif inject_target == "path":
-                    modified = self._inject_payload_in_path(base_request, param_name, payload)
+                    modified = self._inject_payload_in_path(base_request, param_name, payload, retain_value)
                 else:
                     modified = self._inject_payload(base_request, param_name, param_value, payload, retain_value)
                 mod_bytes = self._helpers.stringToBytes(modified)
@@ -687,11 +687,12 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
     # =======================================================================
     # PATH SEGMENT INJECTION
     # =======================================================================
-    def _inject_payload_in_path(self, raw_request, segment_name, payload):
+    def _inject_payload_in_path(self, raw_request, segment_name, payload, retain=False):
         """Inject payload into a named URL path segment.
 
         e.g. GET /admin/userId/ HTTP/1.1  with  segment_name='admin'
-        becomes  GET /<payload>/userId/ HTTP/1.1
+        retain=False → GET /<payload>/userId/ HTTP/1.1
+        retain=True  → GET /admin<payload>/userId/ HTTP/1.1
         Only the first matching segment is replaced.
         """
         parts = raw_request.split("\r\n\r\n", 1)
@@ -720,7 +721,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             new_segments = []
             for seg in segments:
                 if not found and seg == segment_name:
-                    new_segments.append(payload)
+                    new_segments.append(segment_name + payload if retain else payload)
                     found = True
                 else:
                     new_segments.append(seg)
