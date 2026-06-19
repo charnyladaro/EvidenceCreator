@@ -1081,8 +1081,8 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
         return None
 
     def _multipart_modify(self, body, boundary, name, mode):
-        """Empty ('empty') or delete ('delete') a multipart field by name, regardless of its
-        current value. Returns (new_body, found). Used by CSRF token neutralization."""
+        """Empty / truncate / delete a multipart field by name, regardless of its current value.
+        Returns (new_body, found). Used by CSRF token neutralization."""
         delim = "--" + boundary
         segments = body.split(delim)
         found = False
@@ -1096,9 +1096,13 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
                     continue
                 hb = seg.split("\r\n\r\n", 1)
                 if len(hb) == 2:
-                    headers_part = hb[0]
-                    trail = "\r\n" if hb[1].endswith("\r\n") else ""
-                    out.append(headers_part + "\r\n\r\n" + trail)
+                    headers_part, valpart = hb
+                    trail = "\r\n" if valpart.endswith("\r\n") else ""
+                    if mode == "truncate":
+                        value = valpart[:-2] if valpart.endswith("\r\n") else valpart
+                        out.append(headers_part + "\r\n\r\n" + self._truncate_token_value(value) + trail)
+                    else:  # empty
+                        out.append(headers_part + "\r\n\r\n" + trail)
                     continue
             out.append(seg)
         if found:
@@ -1253,9 +1257,24 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
         gbc.gridx = 0; config.add(JLabel("Reject status codes:"), gbc)
         gbc.gridx = 1; config.add(self._csrf_reject_codes, gbc)
         gbc.gridx = 2; config.add(JLabel("Error-page regex:"), gbc)
+        self._csrf_error_regex.setToolTipText(
+            "Case-insensitive regex matched against the whole response. If it matches, a 200 "
+            "is treated as REJECTED. Use | for alternatives, e.g. invalid token|access denied")
         gbc.gridx = 3; config.add(self._csrf_error_regex, gbc)
-        # Row 4
+        # Row 4: how the error-page regex works
+        regex_hint = JLabel(
+            "<html>Optional. A <b>case-insensitive</b> regex matched against the <b>whole response</b> "
+            "(status line + headers + body). If it matches, a <tt>200</tt> is treated as "
+            "<b>REJECTED</b> &mdash; this catches \"soft\" error pages that block the action but still "
+            "return 200. Use <tt>|</tt> for alternatives, e.g. "
+            "<tt>invalid token|access denied|session expired</tt>. Escape literals like <tt>\\?</tt>. "
+            "Leave blank to decide on status codes alone.</html>")
+        regex_hint.setFont(Font("Dialog", Font.ITALIC, 11))
+        regex_hint.setForeground(Color(120, 120, 120))
         gbc.gridy = 4
+        gbc.gridx = 0; gbc.gridwidth = 4; config.add(regex_hint, gbc); gbc.gridwidth = 1
+        # Row 5
+        gbc.gridy = 5
         gbc.gridx = 0; config.add(self._csrf_follow_redirects_cb, gbc)
         samesite = JLabel("Note: tests server-side token/Referer/Origin validation only - not browser SameSite.")
         samesite.setFont(Font("Dialog", Font.ITALIC, 11))
@@ -1455,9 +1474,11 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             # ---- Branch 1: CSRF token ----
             branch = "CSRF token"
             mod_e, found_e = self._csrf_neutralize_token(base_raw, token_name, location, "empty")
+            mod_t, found_t = self._csrf_neutralize_token(base_raw, token_name, location, "truncate")
             mod_d, found_d = self._csrf_neutralize_token(base_raw, token_name, location, "delete")
             variants = [
                 ("Token value emptied", mod_e, found_e),
+                ("Token value truncated", mod_t, found_t),
                 ("Token param deleted", mod_d, found_d),
             ]
             for label, mod, found in variants:
@@ -1478,8 +1499,8 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
                     "result": result, "reason": reason,
                 })
             accepted = [t for t in tests if t["result"] == "ACCEPTED"
-                        and t["name"] in ("Token value emptied", "Token param deleted")]
-            if not (found_e or found_d):
+                        and t["name"] in ("Token value emptied", "Token value truncated", "Token param deleted")]
+            if not (found_e or found_t or found_d):
                 verdict = "INCONCLUSIVE - token '%s' not found (check name/location)" % token_name
                 color = "orange"
             elif accepted:
@@ -1569,8 +1590,21 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
             out.append(line)
         return "\r\n".join(out) + "\r\n\r\n" + body
 
+    @staticmethod
+    def _truncate_token_value(val):
+        """Return a present-but-invalid (truncated) copy of a token value: keeps roughly the
+        first half, always at least one character shorter than the original. This tests whether
+        the server validates the token's *value*, not just its presence. A 1-char value becomes
+        empty (the strongest truncation possible)."""
+        if not val:
+            return val
+        if len(val) <= 1:
+            return val[:-1]
+        return val[:max(1, len(val) // 2)]
+
     def _csrf_neutralize_token(self, raw_request, name, location, mode):
-        """Empty ('empty') or delete ('delete') the named token. Returns (modified, found)."""
+        """Mutate the named token. mode: 'empty' (blank value), 'truncate' (present-but-invalid
+        value) or 'delete' (remove the field entirely). Returns (modified, found)."""
         if location == "param":
             order = ["query", "body", "multipart", "cookie"]
         elif location == "json":
@@ -1606,7 +1640,7 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
 
     @staticmethod
     def _qs_modify(qs, name, mode):
-        """Empty or delete name in an &-separated key=value string. Returns (new, found)."""
+        """Empty / truncate / delete name in an &-separated key=value string. Returns (new, found)."""
         pairs = qs.split("&")
         out = []
         found = False
@@ -1617,11 +1651,15 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
                     found = True
                     if mode == "empty":
                         out.append("%s=" % k)
+                    elif mode == "truncate":
+                        out.append("%s=%s" % (k, BurpExtender._truncate_token_value(_v)))
                     continue
             elif p == name:
                 found = True
                 if mode == "empty":
                     out.append("%s=" % p)
+                elif mode == "truncate":
+                    out.append(p)  # no value present to truncate
                 continue
             out.append(p)
         return "&".join(out), found
@@ -1683,12 +1721,25 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
 
     @staticmethod
     def _json_modify(body, name, mode):
-        """Empty or delete a JSON key. Returns (new_body, found)."""
+        """Empty / truncate / delete a JSON key. Returns (new_body, found)."""
         key = re.escape(name)
         val = r'(?:"(?:[^"\\]|\\.)*"|true|false|null|-?\d+(?:\.\d+)?)'
         if mode == "empty":
             pat = r'("%s"\s*:\s*)%s' % (key, val)
             new_body, c = re.subn(pat, r'\g<1>""', body, count=1)
+            return new_body, c > 0
+        if mode == "truncate":
+            pat = r'("%s"\s*:\s*)(%s)' % (key, val)
+
+            def _trunc(m):
+                raw = m.group(2)
+                if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+                    inner = raw[1:-1]
+                else:
+                    inner = raw  # numeric / bool / null -> becomes a truncated string
+                return m.group(1) + '"' + BurpExtender._truncate_token_value(inner) + '"'
+
+            new_body, c = re.subn(pat, _trunc, body, count=1)
             return new_body, c > 0
         # delete: try to also remove an adjacent comma to keep JSON well-formed
         for pat in (r',\s*"%s"\s*:\s*%s' % (key, val),
@@ -1719,6 +1770,8 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
                             hit = True
                             if mode == "empty":
                                 new_pairs.append("%s=" % k)
+                            elif mode == "truncate":
+                                new_pairs.append("%s=%s" % (k, self._truncate_token_value(_v)))
                             continue
                     new_pairs.append(pair)
                 if hit:
@@ -1745,6 +1798,8 @@ class BurpExtender(IBurpExtender, ITab, IContextMenuFactory, IMessageEditorContr
                 found = True
                 if mode == "empty":
                     out.append("%s:" % line[:cpos])
+                elif mode == "truncate":
+                    out.append("%s: %s" % (line[:cpos], self._truncate_token_value(line[cpos + 1:].strip())))
                 continue
             out.append(line)
         if found:
